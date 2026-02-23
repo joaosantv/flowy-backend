@@ -1,13 +1,9 @@
-# Pastas pesadas do Node
+# Dependências do Node (muito pesadas para o GitHub)
 node_modules/
 
-# Variáveis de ambiente (Segurança)
+# Suas senhas e variáveis de ambiente (Segurança máxima)
 .env
 
 # Banco de dados local do Prisma
 prisma/*.db
 prisma/*.db-journal
-
-# Arquivos de sistema operacional
-.DS_Store
-Thumbs.db
