@@ -1,0 +1,13 @@
+# Pastas pesadas do Node
+node_modules/
+
+# Variáveis de ambiente (Segurança)
+.env
+
+# Banco de dados local do Prisma
+prisma/*.db
+prisma/*.db-journal
+
+# Arquivos de sistema operacional
+.DS_Store
+Thumbs.db

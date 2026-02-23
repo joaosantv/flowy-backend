@@ -1,0 +1,66 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// 1. TABELA DO DONO DO NEGÓCIO (O Vendedor)
+model Profissional {
+  id                String        @id @default(uuid())
+  nome              String
+  email             String        @unique
+  senha             String
+  
+  // GAVETAS DA VERIFICAÇÃO DE E-MAIL
+  codigoVerificacao String?
+  contaVerificada   Boolean       @default(false)
+  
+  // DADOS DO SETUP
+  nomeSalao         String?
+  telefone          String?
+  instagram         String?
+
+  criadoEm          DateTime      @default(now())
+  
+  // Relações
+  servicos          Servico[]
+  agendamentos      Agendamento[]
+}
+
+// 2. TABELA DE SERVIÇOS (Corte, Barba, etc)
+model Servico {
+  id             String       @id @default(uuid())
+  nome           String
+  preco          Float
+  duracaoMinutos Int
+  
+  // Amarrando o serviço ao dono
+  profissionalId String
+  profissional   Profissional @relation(fields: [profissionalId], references: [id])
+  
+  agendamentos   Agendamento[]
+}
+
+// 3. TABELA DE AGENDAMENTOS (A ponte entre o Cliente e o Dono)
+model Agendamento {
+  id              String       @id @default(uuid())
+  dataHora        DateTime
+  status          String       @default("PENDENTE") 
+  
+  // Dados rápidos do cliente
+  nomeCliente     String
+  telefoneCliente String
+  
+  // Amarrando o agendamento ao serviço escolhido
+  servicoId       String
+  servico         Servico      @relation(fields: [servicoId], references: [id])
+  
+  // Amarrando o agendamento ao profissional
+  profissionalId  String
+  profissional    Profissional @relation(fields: [profissionalId], references: [id])
+  
+  criadoEm        DateTime     @default(now())
+}
