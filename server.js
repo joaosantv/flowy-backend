@@ -1,524 +1,156 @@
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
+const nodemailer = require('nodemailer');
 const { PrismaClient } = require('@prisma/client');
-const nodemailer = require('nodemailer'); // Importando o carteiro!
 
-// Inicializando as ferramentas
 const app = express();
 const prisma = new PrismaClient();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET;
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://127.0.0.1:5500';
+const CODE_TTL_MS = 15 * 60 * 1000;
+const allowedOrigins = new Set(FRONTEND_ORIGIN.split(',').map((origin) => origin.trim()).filter(Boolean));
 
-app.use(cors());
-app.use(express.json());
+if (!JWT_SECRET || JWT_SECRET.length < 32 || JWT_SECRET.includes('gere-uma-chave')) throw new Error('JWT_SECRET deve ser uma chave aleatória com ao menos 32 caracteres.');
 
-// ==========================================
-// CONFIGURAÇÃO DO E-MAIL (NODEMAILER)
-// ==========================================
-const enviadorDeEmail = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-        user: 'SEU_EMAIL@gmail.com', // Substitua depois
-        pass: 'SUA_SENHA_DE_APP'     // Substitua depois
-    }
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+    return callback(new Error('Origem não permitida pelo CORS.'));
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Authorization', 'Content-Type'],
+  maxAge: 86400
+}));
+app.use(express.json({ limit: '100kb' }));
+
+const authLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false, message: { erro: 'Muitas tentativas. Tente novamente em alguns minutos.' } });
+const emailLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false, message: { erro: 'Muitas solicitações. Tente novamente em alguns minutos.' } });
+const bookingLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false, message: { erro: 'Muitas solicitações. Tente novamente em alguns minutos.' } });
+
+const transporter = process.env.EMAIL_USER && process.env.EMAIL_PASS
+  ? nodemailer.createTransport({ service: process.env.EMAIL_SERVICE || 'gmail', auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS } })
+  : null;
+
+const publicUser = (user) => ({ id: user.id, nome: user.nome, email: user.email, nomeSalao: user.nomeSalao, telefone: user.telefone, instagram: user.instagram });
+const signToken = (user) => jwt.sign({ sub: user.id, nome: user.nome, email: user.email, nomeSalao: user.nomeSalao, telefone: user.telefone, instagram: user.instagram }, JWT_SECRET, { expiresIn: '7d' });
+const emailIsValid = (email) => typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 254;
+const passwordIsValid = (password) => typeof password === 'string' && password.length >= 8 && password.length <= 128;
+const codeIsValid = (code) => typeof code === 'string' && /^\d{6}$/.test(code);
+const parseService = ({ nome, preco, duracaoMinutos }) => {
+  const price = Number(preco); const duration = Number(duracaoMinutos);
+  if (!nome?.trim() || nome.trim().length > 80 || !Number.isFinite(price) || price < 0 || price > 100000 || !Number.isInteger(duration) || duration <= 0 || duration > 1440) return null;
+  return { nome: nome.trim(), preco: price, duracaoMinutos: duration };
+};
+const authenticate = (req, res, next) => {
+  const token = req.get('authorization')?.replace(/^Bearer\s+/i, '');
+  if (!token) return res.status(401).json({ erro: 'Autenticação necessária.' });
+  try { req.profissionalId = jwt.verify(token, JWT_SECRET).sub; return next(); }
+  catch { return res.status(401).json({ erro: 'Sessão inválida ou expirada. Entre novamente.' }); }
+};
+const sendCodeEmail = async (user, code, subject) => {
+  if (!transporter) throw new Error('E-mail não configurado. Defina EMAIL_USER e EMAIL_PASS.');
+  await transporter.sendMail({ from: process.env.EMAIL_FROM || `Flowy <${process.env.EMAIL_USER}>`, to: user.email, subject, text: `Olá, ${user.nome}! Seu código Flowy é ${code}. Ele expira em 15 minutos.` });
+};
+
+app.get('/', (_req, res) => res.json({ mensagem: 'A API do Flowy está funcionando.' }));
+
+app.post('/api/cadastro', authLimiter, async (req, res) => {
+  try {
+    const { nome, email, senha } = req.body;
+    if (!nome?.trim() || nome.trim().length > 100 || !emailIsValid(email?.trim()) || !passwordIsValid(senha)) return res.status(400).json({ erro: 'Informe nome, e-mail válido e uma senha de 8 a 128 caracteres.' });
+    if (await prisma.profissional.findUnique({ where: { email: email.trim().toLowerCase() } })) return res.status(400).json({ erro: 'E-mail já cadastrado.' });
+    const codigo = String(Math.floor(100000 + Math.random() * 900000));
+    const usuario = await prisma.profissional.create({ data: { nome: nome.trim(), email: email.trim().toLowerCase(), senha: await bcrypt.hash(senha, 12), codigoVerificacao: await bcrypt.hash(codigo, 12), codigoExpiraEm: new Date(Date.now() + CODE_TTL_MS) } });
+    try { await sendCodeEmail(usuario, codigo, 'Seu código de verificação - Flowy'); }
+    catch (error) { await prisma.profissional.delete({ where: { id: usuario.id } }); console.error('Falha no envio de e-mail:', error); return res.status(503).json({ erro: 'Não foi possível enviar o e-mail de verificação. Tente novamente.' }); }
+    return res.status(201).json({ mensagem: 'Código enviado para seu e-mail.', idUsuario: usuario.id });
+  } catch (error) { console.error(error); return res.status(500).json({ erro: 'Erro interno no servidor.' }); }
 });
 
-// ==========================================
-// ROTAS DO SISTEMA
-// ==========================================
-
-app.get('/', (req, res) => {
-    res.json({ mensagem: "A API do Flowy está rodando lisa! 🚀" });
+app.post('/api/verificar-codigo', authLimiter, async (req, res) => {
+  try {
+    const { idUsuario, codigoDigitado } = req.body;
+    const usuario = await prisma.profissional.findUnique({ where: { id: idUsuario } });
+    if (!usuario || !codeIsValid(codigoDigitado) || !usuario.codigoExpiraEm || usuario.codigoExpiraEm < new Date() || !(await bcrypt.compare(codigoDigitado, usuario.codigoVerificacao || ''))) return res.status(400).json({ erro: 'Código inválido ou expirado.' });
+    const verified = await prisma.profissional.update({ where: { id: usuario.id }, data: { contaVerificada: true, codigoVerificacao: null, codigoExpiraEm: null } });
+    return res.json({ mensagem: 'Conta ativada com sucesso.', token: signToken(verified), usuario: publicUser(verified) });
+  } catch (error) { console.error(error); return res.status(500).json({ erro: 'Erro ao validar o código.' }); }
 });
 
-// 1. Rota de CADASTRO (Com envio de código 2FA)
-app.post('/api/cadastro', async (req, res) => {
-    try {
-        const { nome, email, senha } = req.body;
-
-        if (!nome || !email || !senha) return res.status(400).json({ erro: "Preencha tudo!" });
-
-        const usuarioExistente = await prisma.profissional.findUnique({ where: { email: email } });
-        if (usuarioExistente) return res.status(400).json({ erro: "E-mail já cadastrado!" });
-
-        // Gera um código aleatório de 6 dígitos
-        const codigo = Math.floor(100000 + Math.random() * 900000).toString();
-
-        // Salva o usuário com o código e como "Não Verificado" (false)
-        const novoUsuario = await prisma.profissional.create({
-            data: { 
-                nome, 
-                email, 
-                senha, 
-                codigoVerificacao: codigo,
-                contaVerificada: false 
-            }
-        });
-
-        // TENTA ENVIAR O E-MAIL
-        try {
-            await enviadorDeEmail.sendMail({
-                from: 'Equipe Flowy <seuemail@gmail.com>',
-                to: email,
-                subject: 'Seu código de verificação - Flowy',
-                text: `Olá ${nome}! Seu código de verificação é: ${codigo}`
-            });
-        } catch (erroEmail) {
-            console.log("Aviso: E-mail não enviado (Falta configurar a senha do Gmail no código).");
-        }
-
-        // Imprime o código no seu terminal para você conseguir testar sem ter o Gmail configurado ainda!
-        console.log(`\n🔑 CÓDIGO DO USUÁRIO ${nome}: ${codigo}\n`);
-
-        res.status(201).json({ mensagem: "Código gerado!", idUsuario: novoUsuario.id });
-
-    } catch (erro) {
-        console.error("Erro no cadastro:", erro);
-        res.status(500).json({ erro: "Erro interno no servidor." });
-    }
+app.post('/api/login', authLimiter, async (req, res) => {
+  try {
+    const { email, senha } = req.body;
+    const usuario = await prisma.profissional.findUnique({ where: { email: email?.trim().toLowerCase() || '' } });
+    if (!usuario || !(await bcrypt.compare(senha || '', usuario.senha))) return res.status(401).json({ erro: 'E-mail ou senha incorretos.' });
+    if (!usuario.contaVerificada) return res.status(403).json({ erro: 'Sua conta ainda não foi verificada.' });
+    return res.json({ mensagem: 'Login realizado com sucesso.', token: signToken(usuario), usuario: publicUser(usuario) });
+  } catch (error) { console.error(error); return res.status(500).json({ erro: 'Erro interno ao tentar entrar.' }); }
 });
 
-// 1.5. Rota de VERIFICAÇÃO DO CÓDIGO
-app.post('/api/verificar-codigo', async (req, res) => {
-    try {
-        const { idUsuario, codigoDigitado } = req.body;
-
-        const usuario = await prisma.profissional.findUnique({ where: { id: idUsuario } });
-
-        if (!usuario) return res.status(404).json({ erro: "Usuário não encontrado." });
-
-        if (usuario.codigoVerificacao !== codigoDigitado) {
-            return res.status(400).json({ erro: "Código inválido ou incorreto." });
-        }
-
-        // Atualiza a conta para Verificada e limpa o código
-        const usuarioVerificado = await prisma.profissional.update({
-            where: { id: idUsuario },
-            data: { contaVerificada: true, codigoVerificacao: null }
-        });
-
-        res.status(200).json({ 
-            mensagem: "Conta ativada com sucesso!", 
-            usuario: { 
-                id: usuarioVerificado.id, 
-                nome: usuarioVerificado.nome, 
-                email: usuarioVerificado.email,
-                nomeSalao: usuarioVerificado.nomeSalao 
-            }
-        });
-
-    } catch (erro) {
-        console.error("Erro na verificação:", erro);
-        res.status(500).json({ erro: "Erro ao validar o código." });
-    }
+app.post('/api/esqueci-senha', emailLimiter, async (req, res) => {
+  try {
+    const email = req.body.email?.trim().toLowerCase();
+    if (!emailIsValid(email)) return res.status(400).json({ erro: 'Informe um e-mail válido.' });
+    const usuario = await prisma.profissional.findUnique({ where: { email } });
+    if (!usuario) return res.json({ mensagem: 'Se o e-mail estiver cadastrado, enviaremos as instruções de recuperação.' });
+    const codigo = String(Math.floor(100000 + Math.random() * 900000));
+    const updated = await prisma.profissional.update({ where: { id: usuario.id }, data: { codigoVerificacao: await bcrypt.hash(codigo, 12), codigoExpiraEm: new Date(Date.now() + CODE_TTL_MS) } });
+    try { await sendCodeEmail(updated, codigo, 'Recuperação de senha - Flowy'); }
+    catch (error) { console.error(error); return res.status(503).json({ erro: 'Não foi possível enviar o e-mail de recuperação.' }); }
+    return res.json({ mensagem: 'Código enviado para seu e-mail.' });
+  } catch (error) { console.error(error); return res.status(500).json({ erro: 'Erro ao processar a recuperação.' }); }
 });
 
-// 2. Rota de SETUP
+app.post('/api/redefinir-senha', authLimiter, async (req, res) => {
+  try {
+    const { email, codigo, novaSenha } = req.body;
+    if (!passwordIsValid(novaSenha)) return res.status(400).json({ erro: 'A senha deve ter pelo menos 8 caracteres.' });
+    const usuario = await prisma.profissional.findUnique({ where: { email: email?.trim().toLowerCase() || '' } });
+    if (!usuario || !codeIsValid(codigo) || !usuario.codigoExpiraEm || usuario.codigoExpiraEm < new Date() || !(await bcrypt.compare(codigo, usuario.codigoVerificacao || ''))) return res.status(400).json({ erro: 'Código inválido ou expirado.' });
+    await prisma.profissional.update({ where: { id: usuario.id }, data: { senha: await bcrypt.hash(novaSenha, 12), codigoVerificacao: null, codigoExpiraEm: null } });
+    return res.json({ mensagem: 'Senha redefinida com sucesso.' });
+  } catch (error) { console.error(error); return res.status(500).json({ erro: 'Erro ao salvar a nova senha.' }); }
+});
+
+app.use('/api/setup', authenticate);
+app.use('/api/servicos', (req, res, next) => req.method === 'GET' && req.path.startsWith('/public') ? next() : authenticate(req, res, next));
+app.use('/api/clientes', authenticate);
+app.use('/api/financeiro', authenticate);
+app.use('/api/agenda', authenticate);
+
 app.put('/api/setup/:id', async (req, res) => {
-    try {
-        const { nomeSalao, telefone, instagram } = req.body;
-        const usuarioAtualizado = await prisma.profissional.update({
-            where: { id: req.params.id },
-            data: { nomeSalao, telefone, instagram }
-        });
-        res.status(200).json({ mensagem: "Setup concluído!", usuario: usuarioAtualizado });
-    } catch (erro) {
-        res.status(500).json({ erro: "Erro ao salvar os dados." });
-    }
+  try {
+    const { nomeSalao, telefone, instagram } = req.body;
+    if (!nomeSalao?.trim() || !telefone?.trim()) return res.status(400).json({ erro: 'Nome do salão e telefone são obrigatórios.' });
+    const usuario = await prisma.profissional.update({ where: { id: req.profissionalId }, data: { nomeSalao: nomeSalao.trim(), telefone: telefone.trim(), instagram: instagram?.trim() || null } });
+    return res.json({ mensagem: 'Dados salvos.', token: signToken(usuario), usuario: publicUser(usuario) });
+  } catch (error) { console.error(error); return res.status(500).json({ erro: 'Erro ao salvar os dados.' }); }
 });
 
-// 3. CADASTRAR NOVO SERVIÇO
-app.post('/api/servicos', async (req, res) => {
-    try {
-        const { nome, preco, duracaoMinutos, profissionalId } = req.body;
-        const novoServico = await prisma.servico.create({
-            data: {
-                nome: nome,
-                preco: parseFloat(preco),
-                duracaoMinutos: parseInt(duracaoMinutos),
-                profissionalId: profissionalId 
-            }
-        });
-        res.status(201).json({ mensagem: "Serviço criado com sucesso!", servico: novoServico });
-    } catch (erro) {
-        console.error("Erro ao criar serviço:", erro);
-        res.status(500).json({ erro: "Erro ao salvar o serviço no banco." });
-    }
-});
+app.post('/api/servicos', async (req, res) => { try { const service = parseService(req.body); if (!service) return res.status(400).json({ erro: 'Dados do serviço inválidos.' }); const servico = await prisma.servico.create({ data: { ...service, profissionalId: req.profissionalId } }); return res.status(201).json({ mensagem: 'Serviço criado.', servico }); } catch (e) { console.error(e); return res.status(500).json({ erro: 'Erro ao salvar o serviço.' }); } });
+app.get('/api/servicos/:profissionalId', async (req, res) => { try { return res.json(await prisma.servico.findMany({ where: { profissionalId: req.profissionalId } })); } catch (e) { console.error(e); return res.status(500).json({ erro: 'Erro ao carregar os serviços.' }); } });
+app.put('/api/servicos/:id', async (req, res) => { try { const service = parseService(req.body); if (!service) return res.status(400).json({ erro: 'Dados do serviço inválidos.' }); const result = await prisma.servico.updateMany({ where: { id: req.params.id, profissionalId: req.profissionalId }, data: service }); if (!result.count) return res.status(404).json({ erro: 'Serviço não encontrado.' }); return res.json({ mensagem: 'Serviço atualizado.' }); } catch (e) { console.error(e); return res.status(500).json({ erro: 'Erro ao atualizar o serviço.' }); } });
+app.delete('/api/servicos/:id', async (req, res) => { try { const result = await prisma.servico.deleteMany({ where: { id: req.params.id, profissionalId: req.profissionalId } }); if (!result.count) return res.status(404).json({ erro: 'Serviço não encontrado.' }); return res.json({ mensagem: 'Serviço excluído.' }); } catch (e) { console.error(e); return res.status(500).json({ erro: 'Erro ao excluir o serviço.' }); } });
 
-// 4. BUSCAR OS SERVIÇOS DO DONO
-app.get('/api/servicos/:profissionalId', async (req, res) => {
-    try {
-        const servicos = await prisma.servico.findMany({
-            where: { profissionalId: req.params.profissionalId }
-        });
-        res.status(200).json(servicos);
-    } catch (erro) {
-        console.error("Erro ao buscar serviços:", erro);
-        res.status(500).json({ erro: "Erro ao carregar a lista de serviços." });
-    }
-});
+app.get('/api/vitrine/:id', async (req, res) => { try { const profissional = await prisma.profissional.findUnique({ where: { id: req.params.id }, select: { id: true, nome: true, nomeSalao: true, telefone: true, instagram: true, servicos: true } }); return profissional ? res.json(profissional) : res.status(404).json({ erro: 'Profissional não encontrado.' }); } catch (e) { console.error(e); return res.status(500).json({ erro: 'Erro ao carregar a vitrine.' }); } });
+app.get('/api/servico/:id', async (req, res) => { try { const servico = await prisma.servico.findUnique({ where: { id: req.params.id } }); return servico ? res.json(servico) : res.status(404).json({ erro: 'Serviço não encontrado.' }); } catch (e) { console.error(e); return res.status(500).json({ erro: 'Erro ao carregar o serviço.' }); } });
+app.get('/api/agendamentos/:profissionalId', async (req, res) => { try { return res.json(await prisma.agendamento.findMany({ where: { profissionalId: req.params.profissionalId, status: { not: 'CANCELADO' } }, select: { dataHora: true } })); } catch (e) { console.error(e); return res.status(500).json({ erro: 'Erro ao buscar horários.' }); } });
+app.post('/api/agendamentos', bookingLimiter, async (req, res) => { try { const { dataHora, nomeCliente, telefoneCliente, servicoId, profissionalId } = req.body; const date = new Date(dataHora); const telefoneLimpo = String(telefoneCliente || '').replace(/\D/g, ''); if (!nomeCliente?.trim() || nomeCliente.trim().length > 100 || telefoneLimpo.length < 10 || telefoneLimpo.length > 15 || Number.isNaN(date.valueOf()) || date < new Date()) return res.status(400).json({ erro: 'Dados do agendamento inválidos.' }); const servico = await prisma.servico.findFirst({ where: { id: servicoId, profissionalId } }); if (!servico) return res.status(400).json({ erro: 'Serviço inválido.' }); const exists = await prisma.agendamento.findFirst({ where: { profissionalId, dataHora: date, status: { not: 'CANCELADO' } } }); if (exists) return res.status(409).json({ erro: 'Este horário acabou de ser reservado. Escolha outro.' }); const agendamento = await prisma.agendamento.create({ data: { dataHora: date, nomeCliente: nomeCliente.trim(), telefoneCliente: telefoneLimpo, servicoId, profissionalId } }); return res.status(201).json({ mensagem: 'Agendado com sucesso.', agendamento }); } catch (e) { console.error(e); return res.status(500).json({ erro: 'Erro ao salvar o agendamento.' }); } });
 
-// 5. ATUALIZAR UM SERVIÇO (EDITAR)
-app.put('/api/servicos/:id', async (req, res) => {
-    try {
-        const { nome, preco, duracaoMinutos } = req.body;
-        
-        const servicoAtualizado = await prisma.servico.update({
-            where: { id: req.params.id },
-            data: {
-                nome: nome,
-                preco: parseFloat(preco),
-                duracaoMinutos: parseInt(duracaoMinutos)
-            }
-        });
-        res.status(200).json({ mensagem: "Serviço atualizado!", servico: servicoAtualizado });
-    } catch (erro) {
-        console.error("Erro ao editar:", erro);
-        res.status(500).json({ erro: "Erro ao atualizar o serviço." });
-    }
-});
+app.get('/api/clientes/:profissionalId', async (req, res) => { try { const agendamentos = await prisma.agendamento.findMany({ where: { profissionalId: req.profissionalId }, include: { servico: true }, orderBy: { dataHora: 'desc' } }); const clientes = Object.values(agendamentos.reduce((map, ag) => { const key = ag.telefoneCliente; map[key] ||= { nome: ag.nomeCliente, telefone: key, visitas: 0, historico: [] }; map[key].visitas++; map[key].historico.push({ data: ag.dataHora, servicoNome: ag.servico.nome, preco: ag.servico.preco }); return map; }, {})); return res.json(clientes); } catch (e) { console.error(e); return res.status(500).json({ erro: 'Erro ao carregar clientes.' }); } });
+app.get('/api/agenda/:profissionalId', async (req, res) => { try { return res.json(await prisma.agendamento.findMany({ where: { profissionalId: req.profissionalId, status: { not: 'CANCELADO' } }, include: { servico: true }, orderBy: { dataHora: 'asc' } })); } catch (e) { console.error(e); return res.status(500).json({ erro: 'Erro ao carregar a agenda.' }); } });
+app.put('/api/agenda/:id/status', async (req, res) => { try { const status = String(req.body.status || '').toUpperCase(); if (!['PENDENTE', 'CONFIRMADO', 'CONCLUIDO', 'CANCELADO'].includes(status)) return res.status(400).json({ erro: 'Status inválido.' }); const result = await prisma.agendamento.updateMany({ where: { id: req.params.id, profissionalId: req.profissionalId }, data: { status } }); if (!result.count) return res.status(404).json({ erro: 'Agendamento não encontrado.' }); return res.json({ mensagem: 'Status do agendamento atualizado.' }); } catch (e) { console.error(e); return res.status(500).json({ erro: 'Erro ao atualizar o agendamento.' }); } });
+app.get('/api/financeiro/:profissionalId', async (req, res) => { try { const agendamentos = await prisma.agendamento.findMany({ where: { profissionalId: req.profissionalId, status: { not: 'CANCELADO' } }, include: { servico: true }, orderBy: { dataHora: 'desc' } }); const now = new Date(); const values = [0, 0, 0, 0, 0, 0, 0]; let faturamentoMes = 0; const ultimosPagamentos = []; for (const ag of agendamentos) { const date = new Date(ag.dataHora); if (date.getMonth() === now.getMonth() && date.getFullYear() === now.getFullYear()) { faturamentoMes += ag.servico.preco; values[date.getDay()] += ag.servico.preco; } if (ultimosPagamentos.length < 5) ultimosPagamentos.push({ nomeCliente: ag.nomeCliente, servicoNome: ag.servico.nome, preco: ag.servico.preco, dataHora: ag.dataHora }); } const max = Math.max(...values, 1); return res.json({ faturamentoMes, ultimosPagamentos, grafico: values.map((value) => value / max * 100) }); } catch (e) { console.error(e); return res.status(500).json({ erro: 'Erro ao calcular os dados financeiros.' }); } });
 
-// 6. DELETAR UM SERVIÇO
-app.delete('/api/servicos/:id', async (req, res) => {
-    try {
-        await prisma.servico.delete({
-            where: { id: req.params.id }
-        });
-        res.status(200).json({ mensagem: "Serviço deletado com sucesso!" });
-    } catch (erro) {
-        console.error("Erro ao deletar:", erro);
-        res.status(500).json({ erro: "Erro ao deletar o serviço." });
-    }
-});
-
-// 7. ROTA PÚBLICA (VITRINE DO CLIENTE)
-app.get('/api/vitrine/:id', async (req, res) => {
-    try {
-        const profissional = await prisma.profissional.findUnique({
-            where: { id: req.params.id },
-            select: {
-                id: true,
-                nome: true,
-                nomeSalao: true,
-                telefone: true,
-                instagram: true,
-                servicos: true 
-            }
-        });
-
-        if (!profissional) {
-            return res.status(404).json({ erro: "Profissional não encontrado." });
-        }
-
-        res.status(200).json(profissional);
-    } catch (erro) {
-        console.error("Erro na vitrine:", erro);
-        res.status(500).json({ erro: "Erro ao carregar a página do profissional." });
-    }
-});
-
-// 8. BUSCAR UM SERVIÇO ESPECÍFICO (Para mostrar na tela de checkout)
-app.get('/api/servico/:id', async (req, res) => {
-    try {
-        const servico = await prisma.servico.findUnique({
-            where: { id: req.params.id }
-        });
-        
-        if (!servico) return res.status(404).json({ erro: "Serviço não encontrado." });
-        
-        res.status(200).json(servico);
-    } catch (erro) {
-        console.error("Erro ao buscar serviço:", erro);
-        res.status(500).json({ erro: "Erro ao carregar o serviço." });
-    }
-});
-
-// 9. CRIAR O AGENDAMENTO (Salvar a reserva no banco)
-app.post('/api/agendamentos', async (req, res) => {
-    try {
-        const { dataHora, nomeCliente, telefoneCliente, servicoId, profissionalId } = req.body;
-
-        if (!servicoId || !profissionalId) {
-            return res.status(400).json({ erro: "Link inválido. Por favor, volte para a tela do salão e selecione o serviço novamente." });
-        }
-
-        const novoAgendamento = await prisma.agendamento.create({
-            data: {
-                dataHora: new Date(dataHora), 
-                nomeCliente: nomeCliente,
-                telefoneCliente: telefoneCliente,
-                servicoId: servicoId, 
-                profissionalId: profissionalId 
-            }
-        });
-
-        res.status(201).json({ mensagem: "Agendado com sucesso!", agendamento: novoAgendamento });
-    } catch (erro) {
-        console.error("Erro ao criar agendamento:", erro);
-        res.status(500).json({ erro: "Erro ao salvar seu horário. Tente novamente." });
-    }
-});
-
-// 10. BUSCAR AGENDAMENTOS (Para bloquear horários ocupados na tela do cliente)
-app.get('/api/agendamentos/:profissionalId', async (req, res) => {
-    try {
-        const agendamentos = await prisma.agendamento.findMany({
-            where: { 
-                profissionalId: req.params.profissionalId,
-                status: { not: 'CANCELADO' } 
-            },
-            select: { dataHora: true } 
-        });
-        
-        res.status(200).json(agendamentos);
-    } catch (erro) {
-        console.error("Erro ao buscar agendamentos:", erro);
-        res.status(500).json({ erro: "Erro ao buscar horários ocupados." });
-    }
-});
-
-// ==========================================
-// ROTAS DE RECUPERAÇÃO DE SENHA
-// ==========================================
-
-// 11. ROTA DE ESQUECI A SENHA (Gera o código)
-app.post('/api/esqueci-senha', async (req, res) => {
-    try {
-        const { email } = req.body;
-        
-        // Procura se o e-mail existe no banco
-        const usuario = await prisma.profissional.findUnique({ where: { email } });
-
-        if (!usuario) {
-            return res.status(404).json({ erro: "E-mail não encontrado no sistema." });
-        }
-
-        // Gera um código de 6 dígitos novo
-        const codigo = Math.floor(100000 + Math.random() * 900000).toString();
-
-        // Salva esse código na gaveta do usuário
-        await prisma.profissional.update({
-            where: { email },
-            data: { codigoVerificacao: codigo }
-        });
-
-        // Imprime no terminal para você testar
-        console.log(`\n🆘 CÓDIGO DE RECUPERAÇÃO PARA ${usuario.nome}: ${codigo}\n`);
-
-        res.status(200).json({ mensagem: "Código gerado com sucesso!" });
-    } catch (erro) {
-        console.error("Erro na recuperação:", erro);
-        res.status(500).json({ erro: "Erro ao processar a recuperação." });
-    }
-});
-
-// 12. ROTA DE REDEFINIR SENHA (Salva a senha nova)
-app.post('/api/redefinir-senha', async (req, res) => {
-    try {
-        const { email, codigo, novaSenha } = req.body;
-        
-        const usuario = await prisma.profissional.findUnique({ where: { email } });
-
-        // Verifica se o usuário existe e se o código que ele digitou é o mesmo do banco
-        if (!usuario || usuario.codigoVerificacao !== codigo) {
-            return res.status(400).json({ erro: "Código inválido ou incorreto." });
-        }
-
-        // Se bater, atualiza a senha e APAGA o código por segurança
-        await prisma.profissional.update({
-            where: { email },
-            data: { 
-                senha: novaSenha,
-                codigoVerificacao: null 
-            }
-        });
-
-        res.status(200).json({ mensagem: "Senha redefinida com sucesso!" });
-    } catch (erro) {
-        console.error("Erro ao redefinir:", erro);
-        res.status(500).json({ erro: "Erro ao salvar a nova senha." });
-    }
-});
-
-// ==========================================
-// ROTA DE LOGIN
-// ==========================================
-
-// 13. ENTRAR NO SISTEMA
-app.post('/api/login', async (req, res) => {
-    try {
-        const { email, senha } = req.body;
-
-        // 1. Procura o usuário pelo e-mail
-        const usuario = await prisma.profissional.findUnique({ where: { email } });
-
-        // 2. Se não achar o e-mail ou a senha não bater, barra a entrada
-        if (!usuario || usuario.senha !== senha) {
-            return res.status(401).json({ erro: "E-mail ou senha incorretos." });
-        }
-
-        // 3. (Opcional) Verifica se a conta já foi validada com o código de 6 dígitos
-        if (usuario.contaVerificada === false) {
-            return res.status(403).json({ erro: "Sua conta ainda não foi verificada. Volte no cadastro e insira o código." });
-        }
-
-        // 4. Se passou em tudo, devolve os dados para o navegador salvar a "sessão"
-        res.status(200).json({
-            mensagem: "Login realizado com sucesso!",
-            usuario: {
-                id: usuario.id,
-                nome: usuario.nome,
-                email: usuario.email,
-                nomeSalao: usuario.nomeSalao,
-                telefone: usuario.telefone,
-                instagram: usuario.instagram
-            }
-        });
-
-    } catch (erro) {
-        console.error("Erro no login:", erro);
-        res.status(500).json({ erro: "Erro interno no servidor ao tentar logar." });
-    }
-});
-
-// 14. LISTAR CLIENTES E SEU HISTÓRICO
-app.get('/api/clientes/:profissionalId', async (req, res) => {
-    try {
-        // Puxa todos os agendamentos do salão (trazendo os detalhes do serviço junto)
-        const agendamentos = await prisma.agendamento.findMany({
-            where: { profissionalId: req.params.profissionalId },
-            include: { servico: true },
-            orderBy: { dataHora: 'desc' } // Os mais recentes primeiro
-        });
-
-        // Agrupa os agendamentos usando o telefone do cliente como "identidade"
-        const clientesMap = {};
-
-        agendamentos.forEach(ag => {
-            const tel = ag.telefoneCliente;
-            
-            // Se o cliente ainda não tá na lista, cria a ficha dele
-            if (!clientesMap[tel]) {
-                clientesMap[tel] = {
-                    nome: ag.nomeCliente,
-                    telefone: tel,
-                    visitas: 0,
-                    historico: []
-                };
-            }
-            
-            // Adiciona a visita no histórico dele
-            clientesMap[tel].visitas += 1;
-            clientesMap[tel].historico.push({
-                data: ag.dataHora,
-                servicoNome: ag.servico.nome,
-                preco: ag.servico.preco
-            });
-        });
-
-        // Transforma a lista agrupada em um array normal pro Front-end
-        const listaClientes = Object.values(clientesMap);
-
-        res.status(200).json(listaClientes);
-    } catch (erro) {
-        console.error("Erro ao buscar clientes:", erro);
-        res.status(500).json({ erro: "Erro ao carregar a lista de clientes." });
-    }
-});
-
-// ==========================================
-// 15. ROTA DO FINANCEIRO (Faturamento e Gráficos)
-// ==========================================
-app.get('/api/financeiro/:profissionalId', async (req, res) => {
-    try {
-        // Puxa todos os agendamentos do salão (trazendo o preço do serviço junto)
-        const agendamentos = await prisma.agendamento.findMany({
-            where: { 
-                profissionalId: req.params.profissionalId,
-                status: { not: 'CANCELADO' } // Considera como receita tudo que não foi cancelado
-            },
-            include: { servico: true },
-            orderBy: { dataHora: 'desc' }
-        });
-
-        // Pegamos o mês e o ano que estamos agora
-        const dataAtual = new Date();
-        const mesAtual = dataAtual.getMonth();
-        const anoAtual = dataAtual.getFullYear();
-
-        let faturamentoMes = 0;
-        const ultimosPagamentos = [];
-        const ganhosPorDiaSemana = [0, 0, 0, 0, 0, 0, 0]; // Domingo a Sábado
-
-        agendamentos.forEach(ag => {
-            const dataAg = new Date(ag.dataHora);
-            const preco = ag.servico.preco;
-
-            // 1. Calcula o faturamento apenas do mês atual
-            if (dataAg.getMonth() === mesAtual && dataAg.getFullYear() === anoAtual) {
-                faturamentoMes += preco;
-                
-                // 2. Separa o faturamento por dia da semana para o gráfico (0 = Dom, 1 = Seg...)
-                const diaSemana = dataAg.getDay();
-                ganhosPorDiaSemana[diaSemana] += preco;
-            }
-
-            // 3. Separa os últimos 5 agendamentos para a listinha de pagamentos
-            if (ultimosPagamentos.length < 5) {
-                ultimosPagamentos.push({
-                    nomeCliente: ag.nomeCliente,
-                    servicoNome: ag.servico.nome,
-                    preco: preco,
-                    dataHora: ag.dataHora
-                });
-            }
-        });
-
-        // 4. Calcula a porcentagem de cada barra do gráfico para o HTML conseguir desenhar!
-        const maxGanho = Math.max(...ganhosPorDiaSemana) || 1; // Acha o dia que ganhou mais
-        const graficoPorcentagem = ganhosPorDiaSemana.map(valor => (valor / maxGanho) * 100);
-
-        res.status(200).json({
-            faturamentoMes,
-            ultimosPagamentos,
-            grafico: graficoPorcentagem
-        });
-
-    } catch (erro) {
-        console.error("Erro no financeiro:", erro);
-        res.status(500).json({ erro: "Erro ao calcular os dados financeiros." });
-    }
-});
-
-// ==========================================
-// 16. ROTA DA AGENDA (Buscar todos os detalhes)
-// ==========================================
-app.get('/api/agenda/:profissionalId', async (req, res) => {
-    try {
-        // Traz TODOS os agendamentos ativos do profissional, do mais cedo pro mais tarde
-        const agendamentos = await prisma.agendamento.findMany({
-            where: { 
-                profissionalId: req.params.profissionalId,
-                status: { not: 'CANCELADO' }
-            },
-            include: {
-                servico: true // O Prisma traz junto o nome do serviço, preço e duração!
-            },
-            orderBy: {
-                dataHora: 'asc' // Ordem cronológica (09:00, 09:30, 10:00...)
-            }
-        });
-
-        res.status(200).json(agendamentos);
-    } catch (erro) {
-        console.error("Erro na agenda:", erro);
-        res.status(500).json({ erro: "Erro ao carregar a agenda." });
-    }
-});
-
-// ==========================================
-// LIGANDO O MOTOR (SEMPRE NO FINAL!)
-// ==========================================
-app.listen(PORT, () => {
-    console.log(`Servidor rodando em http://localhost:${PORT}`);
-});
+app.use((error, _req, res, _next) => { console.error(error); res.status(500).json({ erro: 'Erro interno no servidor.' }); });
+app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));

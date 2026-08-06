@@ -16,6 +16,7 @@ model Profissional {
   
   // GAVETAS DA VERIFICAÇÃO DE E-MAIL
   codigoVerificacao String?
+  codigoExpiraEm    DateTime?
   contaVerificada   Boolean       @default(false)
   
   // DADOS DO SETUP
